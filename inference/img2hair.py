@@ -52,7 +52,7 @@ class Mediapipe():
 
         base_options = python.BaseOptions(
             model_asset_path=os.path.join(SCRIPT_DIR,'./assets/face_landmarker.task'),
-            delegate=mp.tasks.BaseOptions.Delegate.GPU
+            delegate=mp.tasks.BaseOptions.Delegate.CPU
             )
         options = vision.FaceLandmarkerOptions(
                                         running_mode=mode,
@@ -216,57 +216,23 @@ class DiffLocksInference():
         self.nr_iters_denoise=nr_iters_denoise
         self.cfg_val=cfg_val
 
+        # Store only paths/configs — models are loaded on demand to avoid RAM exhaustion
+        self.path_ckpt_strandcodec = path_ckpt_strandcodec
+        self.path_ckpt_difflocks = path_ckpt_difflocks
+        self.path_ckpt_rgb2material = path_ckpt_rgb2material
 
         self.mediapipe_img=Mediapipe(VisionRunningMode.IMAGE)
 
-        #create dinov2 
         image_size=770 #nearest images size that divides cleanly by patch size 14
         self.dinov2_latents_preprocessor = T.Compose([
             T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
             T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ])
-        self.dinov2_latents_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg')
-        self.dinov2_latents_model.cuda()
 
-        #difflocks strand codec
-        self.strand_codec = StrandCodec(do_vae=False, 
-                        decode_type="dir",
-                        scale_init=30.0,
-                        nr_verts_per_strand=256, nr_values_to_decode=255,
-                        dim_per_value_decoded=3).cuda()
-        self.strand_codec.load_state_dict(torch.load(path_ckpt_strandcodec))
-        self.strand_codec.eval()
-
-
-        #difflocks diffusion
+        # Load difflocks config (tiny, just JSON)
         config = K.config.load_config(path_config_difflocks)
+        self.difflocks_config = config
         self.model_config = config['model']
-        inner_model_ema = K.config.make_model(config).cuda()
-        inner_model_ema.eval()
-        model_ema = K.config.make_denoiser_wrapper(config)(inner_model_ema)
-        model_ema.eval()
-        #IMPORTANT set the dropout rate here for the condition to whatever you need, to make it either conditional or unconditional
-        # model_ema.inner_model.condition_dropout_rate=0.0
-        # if state_path.exists() :
-            # state = json.load(open(state_path))
-            # ckpt_path = state['latest_checkpoint']
-        print(f'Resuming from {path_ckpt_difflocks}...')
-        ckpt = torch.load(path_ckpt_difflocks, map_location='cpu')
-        model_ema.inner_model.load_state_dict(ckpt['model_ema'])
-        del ckpt
-        self.model_ema=model_ema.cuda()
-
-        #rgb2material
-        if path_ckpt_rgb2material is not None:
-            self.rgb2material = RGB2MaterialModel(
-                        input_dim=1024,
-                        out_dim=11,
-                        hidden_dim=64).cuda()
-            self.rgb2material.load_state_dict(torch.load(path_ckpt_rgb2material))
-            self.rgb2material.eval()
-        else:
-            self.rgb2material=None
-
 
         #hairsynth data
         self.normalization_dict=DiffLocksDataset.get_normalization_data()
@@ -303,28 +269,44 @@ class DiffLocksInference():
         print("rgb_img",rgb_img.shape)
 
 
-        #dinov2 v2 
+        #dinov2 v2 — load, run, delete
+        print("Loading DINOv2...")
+        dinov2_latents_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg').cuda().eval()
         rgb_input = self.dinov2_latents_preprocessor(rgb_img).to("cuda")
-        dinov2_output = self.dinov2_latents_model.forward_features(rgb_input)
+        dinov2_output = dinov2_latents_model.forward_features(rgb_input)
         patch_tok = dinov2_output["x_norm_patchtokens"].clone()
         cls_tok = dinov2_output["x_norm_clstoken"].clone()
+        del dinov2_latents_model, dinov2_output, rgb_input
+        torch.cuda.empty_cache()
+
         cls_token=cls_tok
         patch_embeddings = patch_tok
         #reshape to [Batch_size, h, w, embedding]
         batch_size, num_patches, hidden_size = patch_embeddings.shape
         h = w = int(num_patches ** 0.5)  # Assuming the number of patches is a perfect square (e.g., 14x14)
         patch_embeddings_reshaped = patch_embeddings.reshape(batch_size, h, w, hidden_size)
-        patch_embeddings_reshaped=patch_embeddings_reshaped.permute(0,3,1,2).contiguous() #Make it bchw 
+        patch_embeddings_reshaped=patch_embeddings_reshaped.permute(0,3,1,2).contiguous() #Make it bchw
         print("patch_embeddings_reshaped",patch_embeddings_reshaped.shape)
         extra_args['latents_dict']["dinov2"]={
                                     "cls_token": cls_token,
                                     "final_latent": patch_embeddings_reshaped,
                                     }
-        
 
-        #run diffusion
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16): #we need this because flash attention only works with float16 and bfloat16
-            scalp_texture = sample_images_cfg(1, cfg_val=self.cfg_val, cfg_interval=[0.0, 5.0], model_ema=self.model_ema, model_config=self.model_config, nr_iters=self.nr_iters_denoise, extra_args=extra_args)
+
+        #run diffusion — load, run, delete
+        print(f'Loading diffusion model from {self.path_ckpt_difflocks}...')
+        inner_model_ema = K.config.make_model(self.difflocks_config).cpu()
+        inner_model_ema.eval()
+        model_ema = K.config.make_denoiser_wrapper(self.difflocks_config)(inner_model_ema)
+        model_ema.eval()
+        ckpt = torch.load(self.path_ckpt_difflocks, map_location='cpu')
+        model_ema.inner_model.load_state_dict(ckpt['model_ema'])
+        del ckpt
+        model_ema = model_ema.cuda()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            scalp_texture = sample_images_cfg(1, cfg_val=self.cfg_val, cfg_interval=[0.0, 5.0], model_ema=model_ema, model_config=self.model_config, nr_iters=self.nr_iters_denoise, extra_args=extra_args)
+        del model_ema, inner_model_ema
+        torch.cuda.empty_cache()
         scalp_texture=scalp_texture.float()
         scalp_texture_orig=scalp_texture
         if out_path:
@@ -344,15 +326,35 @@ class DiffLocksInference():
         # density_map[density_map>0.02]+=1.0
         
 
-        strand_points_world, strand_points_tbn = sample_strands_from_scalp_with_density(scalp_texture, density_map, self.strand_codec, normalization_dict=self.normalization_dict, scalp_mesh_data=self.scalp_mesh_data, tbn_space_to_world_func=tbn_space_to_world, nr_chunks=self.nr_chunks_decode_strands, upsample_multiplier=3)
+        #strand codec — load, run, delete
+        print("Loading strand codec...")
+        strand_codec = StrandCodec(do_vae=False,
+                        decode_type="dir",
+                        scale_init=30.0,
+                        nr_verts_per_strand=256, nr_values_to_decode=255,
+                        dim_per_value_decoded=3).cuda()
+        strand_codec.load_state_dict(torch.load(self.path_ckpt_strandcodec, map_location='cpu'))
+        strand_codec.eval()
+        strand_points_world, strand_points_tbn = sample_strands_from_scalp_with_density(scalp_texture, density_map, strand_codec, normalization_dict=self.normalization_dict, scalp_mesh_data=self.scalp_mesh_data, tbn_space_to_world_func=tbn_space_to_world, nr_chunks=self.nr_chunks_decode_strands, upsample_multiplier=3)
+        del strand_codec
+        torch.cuda.empty_cache()
 
 
         #get also material
         hair_material_dict=None
-        if self.rgb2material is not None:
+        if self.path_ckpt_rgb2material is not None:
+            print("Loading rgb2material...")
+            rgb2material = RGB2MaterialModel(
+                        input_dim=1024,
+                        out_dim=11,
+                        hidden_dim=64).cuda()
+            rgb2material.load_state_dict(torch.load(self.path_ckpt_rgb2material, map_location='cpu'))
+            rgb2material.eval()
             rgb2mat_input_dict={}
             rgb2mat_input_dict["dinov2_latents"]=patch_embeddings_reshaped
-            hair_material_dict = self.rgb2material(rgb2mat_input_dict)
+            hair_material_dict = rgb2material(rgb2mat_input_dict)
+            del rgb2material
+            torch.cuda.empty_cache()
 
             #save material
             if out_path:

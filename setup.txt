@@ -1,0 +1,1 @@
+python inference_difflocks.py     --img_path=./samples/medium_11.png     --out_path=./outputs_inference/     --blender_path=~/Downloads/blender-4.5.2-linux-x64/blender     --export_alembic

@@ -20,10 +20,10 @@ def run():
 
     #argparse
     parser = argparse.ArgumentParser(description='Get the weights of each dimensions after training a strand VAE')
-    parser.add_argument('--strand_checkpoint_path', default="./checkpoints/strand_vae/strand_codec.pt", type=str, help='Path to the strandVAE checkpoint')
-    parser.add_argument('--difflocks_checkpoint_path', default="./checkpoints/difflocks_diffusion/scalp_v9_40k_06730000.pth", type=str, help='Path to the difflocks checkpoint')
+    parser.add_argument('--strand_checkpoint_path', default="./checkpoints/checkpoints/strand_vae/strand_codec.pt", type=str, help='Path to the strandVAE checkpoint')
+    parser.add_argument('--difflocks_checkpoint_path', default="./checkpoints/checkpoints/difflocks_diffusion/scalp_v9_40k_06730000.pth", type=str, help='Path to the difflocks checkpoint')
     parser.add_argument('--difflocks_config_path', default="./configs/config_scalp_texture_conditional.json", type=str, help='Path to the difflocks config')
-    parser.add_argument('--rgb2mat_checkpoint_path', default="./checkpoints/rgb2material/rgb2material.pt", type=str,  help='Path to the rgb2material checkpoint')
+    parser.add_argument('--rgb2mat_checkpoint_path', default="./checkpoints/checkpoints/rgb2material/rgb2material.pt", type=str,  help='Path to the rgb2material checkpoint')
     parser.add_argument('--blender_path', type=str, default="", help='Path to the blender executable')
     parser.add_argument('--blender_nr_threads', default=8, type=int, help='Number of threads for blender to use')
     parser.add_argument('--blender_strands_subsample', default=1.0, type=float, help='Amount of subsample of the strands(1.0=full strands, 0.5=half strands)')
@@ -48,7 +48,7 @@ def run():
 
     #create blender file and optionally an alembic file
     if args.blender_path!="":
-        cmd=[args.blender_path, "-t", str(args.blender_nr_threads), "--background", "--python", "./inference/npz2blender.py", "--", "--input_npz", os.path.join(args.out_path,"difflocks_output_strands.npz"), "--out_path", args.out_path, "--strands_subsample", str(args.blender_strands_subsample), "--vertex_subsample", str(args.blender_vertex_subsample), "--alembic_resolution", str(args.alembic_resolution) ]
+        cmd=[os.path.expanduser(args.blender_path), "-t", str(args.blender_nr_threads), "--background", "--python", "./inference/npz2blender.py", "--", "--input_npz", os.path.join(args.out_path,"difflocks_output_strands.npz"), "--out_path", args.out_path, "--strands_subsample", str(args.blender_strands_subsample), "--vertex_subsample", str(args.blender_vertex_subsample), "--alembic_resolution", str(args.alembic_resolution) ]
         if args.do_shrinkwrap:
             cmd.append("--shrinkwrap")
         if args.export_alembic:

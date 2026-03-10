@@ -9,8 +9,10 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
 
-import flash_attn
-
+try:
+    import flash_attn
+except ImportError:
+    flash_attn = None
 
 
 try:
@@ -118,66 +120,57 @@ class SpatialTransformerSimpleV2(nn.Module):
             x_qkv = self.x_qkv_proj(x)
             pos = rearrange(pos, "... h w e -> ... (h w) e").to(x_qkv.dtype)
             x_theta = self.x_pos_emb(pos)
-            if use_flash_2(x_qkv):
-                x_qkv = rearrange(x_qkv, "n h w (t nh e) -> n (h w) t nh e", t=3, e=self.d_head)
-                x_qkv = scale_for_cosine_sim_qkv(x_qkv, self.x_scale, 1e-6)
-                x_theta = torch.stack((x_theta, x_theta, torch.zeros_like(x_theta)), dim=-3)
-                x_qkv = apply_rotary_emb_(x_qkv, x_theta)
-                x_q, x_k, x_v = x_qkv.chunk(3,dim=-3)
-            else:
-                print("we couldnt run flash2, maybe it's not installed or the input si not bfloat16")
-                exit(1)
+            x_qkv = rearrange(x_qkv, "n h w (t nh e) -> n (h w) t nh e", t=3, e=self.d_head)
+            x_qkv = scale_for_cosine_sim_qkv(x_qkv, self.x_scale, 1e-6)
+            x_theta = torch.stack((x_theta, x_theta, torch.zeros_like(x_theta)), dim=-3)
+            x_qkv = apply_rotary_emb_(x_qkv, x_theta)
+            x_q, x_k, x_v = x_qkv.chunk(3, dim=-3)
         else:
             #x to q
             x_q = self.x_q_proj(x)
             pos = rearrange(pos, "... h w e -> ... (h w) e").to(x_q.dtype)
             x_theta = self.x_pos_emb(pos)
-            if use_flash_2(x_q):
-                x_q = rearrange(x_q, "n h w (nh e) -> n (h w) nh e", e=self.d_head)
-                x_q = scale_for_cosine_sim_single(x_q, self.x_scale[:, None], 1e-6)
-                x_q=x_q.unsqueeze(2) #n (h w) 1 nh e
-                x_theta=x_theta.unsqueeze(1)
-                x_q = apply_rotary_emb_(x_q, x_theta)
-            else:
-                print("we couldnt run flash2, maybe it's not installed or the input si not bfloat16")
-                exit(1)
-
+            x_q = rearrange(x_q, "n h w (nh e) -> n (h w) nh e", e=self.d_head)
+            x_q = scale_for_cosine_sim_single(x_q, self.x_scale[:, None], 1e-6)
+            x_q = x_q.unsqueeze(2)  # n (h w) 1 nh e
+            x_theta = x_theta.unsqueeze(1)
+            x_q = apply_rotary_emb_(x_q, x_theta)
 
         #context to kv
         cond_kv = self.cond_kv_proj(context)
-        # print("cond_kv init",cond_kv.shape)
         context_pos = rearrange(context_pos, "... h w e -> ... (h w) e").to(cond_kv.dtype)
         cond_theta = self.cond_pos_emb(context_pos)
-        if use_flash_2(cond_kv):
-            cond_kv = rearrange(cond_kv, "n h w (t nh e) -> n (h w) t nh e", t=2, e=self.d_head)
-            cond_k, cond_v = cond_kv.unbind(2) # makes each n (h w) nh e
-            cond_k = scale_for_cosine_sim_single(cond_k, self.cond_scale[:, None], 1e-6)
-            cond_k=cond_k.unsqueeze(2) #n (h w) 1 nh e
-            cond_theta=cond_theta.unsqueeze(1)
-            cond_k = apply_rotary_emb_(cond_k, cond_theta)
-            cond_k=cond_k.squeeze(2)
-        else:
-            print("we couldnt run flash2, maybe it's not installed or the input si not bfloat16")
-            exit(1)
+        cond_kv = rearrange(cond_kv, "n h w (t nh e) -> n (h w) t nh e", t=2, e=self.d_head)
+        cond_k, cond_v = cond_kv.unbind(2)  # each: n (h w) nh e
+        cond_k = scale_for_cosine_sim_single(cond_k, self.cond_scale[:, None], 1e-6)
+        cond_k = cond_k.unsqueeze(2)  # n (h w) 1 nh e
+        cond_theta = cond_theta.unsqueeze(1)
+        cond_k = apply_rotary_emb_(cond_k, cond_theta)
+        cond_k = cond_k.squeeze(2)
 
         #doing self attention by concating K and V between X and cond
         if self.do_self_attention:
             k = torch.cat([x_k, cond_k.unsqueeze(2)], dim=1)
             v = torch.cat([x_v, cond_v.unsqueeze(2)], dim=1)
         else:
-            # print("not doing self attention")
-            k=cond_k.unsqueeze(2)
-            v=cond_v.unsqueeze(2)
-        q=x_q
-        
+            k = cond_k.unsqueeze(2)
+            v = cond_v.unsqueeze(2)
+        q = x_q
 
-        #rearange a bit
-        q=q.squeeze(2)
-        kv=torch.cat([k,v],2)
-        # print("final q before giving to flash",q.shape)
-        # print("final kv before giving to flash",kv.shape)
+        #rearrange a bit
+        q = q.squeeze(2)   # n seq nh e
+        kv = torch.cat([k, v], 2)  # n seq_k 2 nh e
 
-        x = flash_attn.flash_attn_kvpacked_func(q, kv, softmax_scale=1.0)
+        if flash_attn is not None and use_flash_2(q):
+            x = flash_attn.flash_attn_kvpacked_func(q, kv, softmax_scale=1.0)
+        else:
+            # Fallback: use PyTorch scaled_dot_product_attention
+            k_t, v_t = kv.unbind(2)  # each: n seq_k nh e
+            q_s = rearrange(q, 'n s nh e -> n nh s e')
+            k_s = rearrange(k_t, 'n s nh e -> n nh s e')
+            v_s = rearrange(v_t, 'n s nh e -> n nh s e')
+            x = F.scaled_dot_product_attention(q_s, k_s, v_s, scale=1.0)
+            x = rearrange(x, 'n nh s e -> n s nh e')
 
         x = rearrange(x, 'b (h w) nh e -> b (h w) (nh e)', nh=self.n_heads, e=self.d_head, h=h, w=w)
 
@@ -186,17 +179,13 @@ class SpatialTransformerSimpleV2(nn.Module):
         x = self.proj_out(x)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w, c=c)
 
-        x=  x + x_in 
+        x = x + x_in
 
         #attention part finished------
 
         #linear feed forward
         x = rearrange(x, 'b c h w -> b h w c', h=h, w=w, c=c)
-
-        # print("x before ff is ", x.shape)
         x = self.ff(x, global_cond)
-
-
         x = rearrange(x, 'b h w c -> b c h w', h=h, w=w, c=c)
 
         return x
