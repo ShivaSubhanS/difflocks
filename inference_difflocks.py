@@ -5,12 +5,14 @@
 #   --out_path=./outputs_inference/ 
 
 from inference.img2hair import DiffLocksInference
+from extract_hair_colors import HairColorExtractor
 import subprocess
 import os
 import argparse
 import torch
 import numpy as np
 import random
+import json
 
 torch.manual_seed(5)
 np.random.seed(5)
@@ -48,7 +50,26 @@ def run():
 
     #create blender file and optionally an alembic file
     if args.blender_path!="":
-        cmd=[os.path.expanduser(args.blender_path), "-t", str(args.blender_nr_threads), "--background", "--python", "./inference/npz2blender.py", "--", "--input_npz", os.path.join(args.out_path,"difflocks_output_strands.npz"), "--out_path", args.out_path, "--strands_subsample", str(args.blender_strands_subsample), "--vertex_subsample", str(args.blender_vertex_subsample), "--alembic_resolution", str(args.alembic_resolution) ]
+        # Extract hair colors from input image and save to out_path
+        print("\n--- Extracting hair colors from input image ---")
+        face_landmarker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inference", "assets", "face_landmarker.task")
+        color_extractor = HairColorExtractor(face_landmarker_path)
+        dark_hex, light_hex = color_extractor.extract_hair_colors(args.img_path)
+        
+        dark_color_arg = []
+        light_color_arg = []
+        if dark_hex and light_hex:
+            # Save hair_colors.json
+            hair_colors_path = os.path.join(args.out_path, "hair_colors.json")
+            with open(hair_colors_path, 'w') as f:
+                json.dump({"dark_root_color": dark_hex, "light_tip_color": light_hex}, f, indent=2)
+            print(f"✓ Saved hair colors to {hair_colors_path}")
+            dark_color_arg = ["--dark_color", dark_hex]
+            light_color_arg = ["--light_color", light_hex]
+        else:
+            print("⚠ Could not extract hair colors, using defaults")
+
+        cmd=[os.path.expanduser(args.blender_path), "-t", str(args.blender_nr_threads), "--background", "--python", "./inference/npz2blender.py", "--", "--input_npz", os.path.join(args.out_path,"difflocks_output_strands.npz"), "--out_path", args.out_path, "--strands_subsample", str(args.blender_strands_subsample), "--vertex_subsample", str(args.blender_vertex_subsample), "--alembic_resolution", str(args.alembic_resolution) ] + dark_color_arg + light_color_arg
         if args.do_shrinkwrap:
             cmd.append("--shrinkwrap")
         if args.export_alembic:
