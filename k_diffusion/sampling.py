@@ -670,7 +670,8 @@ def sample_dpmpp_2m_sde_cfg(model, x, sigmas, cfg_val, cfg_interval, extra_args=
     old_denoised = None
     h_last = None
 
-    for i in trange(len(sigmas) - 1, disable=disable):
+    pbar = trange(len(sigmas) - 1, disable=disable)
+    for i in pbar:
 
         #switch the cfg on or off depending on where in the schedule we are
         #from https://arxiv.org/pdf/2404.07724
@@ -682,7 +683,7 @@ def sample_dpmpp_2m_sde_cfg(model, x, sigmas, cfg_val, cfg_interval, extra_args=
             cfg_val_cur=1.0
         # print("sigmas[i]",sigmas[i])
         # print("cfg_interval", cfg_interval)
-        print("cfg_val_cur",cfg_val_cur, " for sigma ", sigmas[i])
+        pbar.set_postfix(cfg=cfg_val_cur, sigma=f"{sigmas[i].item():.4f}")
 
 
         # denoised = model(x, sigmas[i] * s_in, **extra_args)

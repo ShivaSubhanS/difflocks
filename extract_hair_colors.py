@@ -24,6 +24,44 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 HAIR_LABEL = 1
 
 
+def _remove_ambient_cast(rgb: np.ndarray) -> np.ndarray:
+    """
+    Remove ambient light color cast from a hair color.
+
+    Black/dark hair has almost zero real saturation — it just reflects ambient
+    light (often blue or purple from sky/room). This corrects by reducing
+    saturation proportionally to how dark the color is:
+      - brightness=0   → saturation scaled to 0   (pure black)
+      - brightness=80  → saturation scaled to 0.2 (very dark, near-achromatic)
+      - brightness=160 → saturation scaled to 0.65 (medium — some color preserved)
+      - brightness=220 → saturation unchanged      (light beige/blonde fully kept)
+
+    Also shifts hue slightly toward warm (orange/brown) range for dark hair,
+    since cool-cast dark hair is almost never correct for rendering.
+    """
+    pixel = rgb.reshape(1, 1, 3).astype(np.uint8)
+    hsv = cv2.cvtColor(pixel, cv2.COLOR_RGB2HSV).reshape(3).astype(float)
+    h, s, v = hsv  # H: 0-179, S: 0-255, V: 0-255
+
+    brightness = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+
+    # Saturation scale: dark → less saturation (removes ambient cast)
+    # Smooth ramp: 0 at brightness=0, 1 at brightness=220+
+    sat_scale = np.clip(brightness / 220.0, 0.0, 1.0) ** 0.6
+    s_new = s * sat_scale
+
+    # For dark colors with a cool (blue/purple) hue cast: nudge toward warm brown
+    # Blue/purple range in OpenCV HSV: H ~ 100-160
+    if brightness < 120 and 90 <= h <= 160:
+        # Shift hue toward warm brown (H~15 in OpenCV = ~30° which is brown/orange)
+        warmth_shift = (160 - h) / 160.0 * 20  # max 20 units toward warm
+        h = max(0, h - warmth_shift)
+
+    hsv_new = np.array([h, s_new, v], dtype=np.float32).reshape(1, 1, 3).astype(np.uint8)
+    rgb_new = cv2.cvtColor(hsv_new, cv2.COLOR_HSV2RGB).reshape(3)
+    return rgb_new
+
+
 class HairColorExtractor:
     def __init__(self, face_landmarker_path, segmenter_path=None):
         # Face Landmarker (for fallback / forehead reference)
@@ -68,7 +106,7 @@ class HairColorExtractor:
         2. K-means cluster the hair pixels
         3. Pick darkest and lightest significant clusters
         """
-        img = cv2.imread(image_path)
+        img = cv2.imread(os.path.expanduser(image_path))
         if img is None:
             print(f"ERROR: Could not load image: {image_path}")
             return None, None
@@ -194,6 +232,25 @@ class HairColorExtractor:
                 dark_rgb = np.median(hair_pixels[dark_mask_p], axis=0).astype(np.uint8)
             if light_mask_p.sum() > 0:
                 light_rgb = np.median(hair_pixels[light_mask_p], axis=0).astype(np.uint8)
+
+        # Remove ambient light color cast.
+        # Black/dark hair reflects ambient light (blue, purple) which biases the
+        # extracted color. In HSV: darken the saturation proportionally to how dark
+        # the color is, so very dark hair approaches a neutral dark brown/black.
+        dark_rgb = _remove_ambient_cast(dark_rgb)
+        light_rgb = _remove_ambient_cast(light_rgb)
+
+        # If all clusters are still relatively bright (brightness > 80),
+        # the hair is likely being lit heavily. Scale down the dark color
+        # so it actually reads as dark in the render.
+        all_brightness = [0.299*c[0] + 0.587*c[1] + 0.114*c[2] for c in centers]
+        max_brightness = max(all_brightness)
+        dark_b_final = 0.299 * dark_rgb[0] + 0.587 * dark_rgb[1] + 0.114 * dark_rgb[2]
+        if dark_b_final > 80 and max_brightness < 160:
+            # All clusters are mid-range — darken the root
+            scale = 0.6
+            dark_rgb = np.clip(dark_rgb.astype(float) * scale, 0, 255).astype(np.uint8)
+            print(f"  Ambient brightness correction: darkened root by {scale:.1f}x")
 
         dark_hex = '#{:02x}{:02x}{:02x}'.format(dark_rgb[0], dark_rgb[1], dark_rgb[2])
         light_hex = '#{:02x}{:02x}{:02x}'.format(light_rgb[0], light_rgb[1], light_rgb[2])

@@ -388,7 +388,7 @@ class DiffLocksInference():
 
 
     def file2hair(self, file_path, out_path):
-        frame=cv2.imread(file_path)
+        frame=cv2.imread(os.path.expanduser(file_path))
 
         frame = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
 
